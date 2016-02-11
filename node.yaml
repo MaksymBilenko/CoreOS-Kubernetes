@@ -1,0 +1,127 @@
+#cloud-config
+
+---
+write-files:
+  - path: /etc/conf.d/nfs
+    permissions: '0644'
+    content: |
+      OPTS_RPC_MOUNTD=""
+  - path: /opt/bin/wupiao
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+      [ -n "$1" ] && \
+        until curl -o /dev/null -sIf http://${1}; do \
+          sleep 1 && echo .;
+        done;
+      exit $?
+
+users:
+  - name: core
+    ssh-authorized-keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDOvV2/GRzPrS5LKHoHXyGvZ+ZKCAopK+MjQb2kCuiwWBm9BR1c3S99GJ2lyGoZMYumkG8iDfk43k6npxqhGtJcur0Xp5wULp7TQ7o94d68o7J8phqR3YrBLYiJ7xV9CZ+VerJxmUB6YwxD8JWUy9t55Fo4CFDkomWzbJMQnes8tdDEIdzy346iXq0GhDxcO6xY/EtlKHDGrnQD/eaf8hQZkrtiG23Fl4k9j5awbxpa9F1L1/UkcNR/r6g2IoNSikH1Bg9Uz6tmvP7lEmixaSilZp98aX4fKpAfg3wfXt4HRA57OQ7JXciFji2N37WjJ409agsCK10PtgGLEL4daV/N maksymbilenko@MacBook-Pro-Maksym.local"
+    groups: 
+      - sudo
+    shell: /bin/bash
+
+#hostname: node
+coreos:
+  etcd2:
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    advertise-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    initial-cluster: "master=http://<master-ip>:2380"
+    proxy: on
+  fleet:
+    metadata: "role=node"
+  units:
+    - name: remove-etcd-configuration.service
+      command: start
+      content: |
+        [Unit]
+        Description=Remove existing etcd2 configuration
+        Documentation=https://github.com/coreos/etcd/issues/4015
+        Before=etcd2.service
+        [Service]
+        ExecStartPre=/usr/bin/rm -rf /var/lib/etcd2
+        ExecStart=/usr/bin/mkdir -p /var/lib/etcd2
+        ExecStartPost=/usr/bin/chown etcd /var/lib/etcd2/
+        RemainAfterExit=no
+        Type=oneshot
+    - name: etcd2.service
+      command: restart
+    - name: setup-network-environment.service
+      command: start
+      content: |
+        [Unit]
+        Description=Setup Network Environment
+        Documentation=https://github.com/kelseyhightower/setup-network-environment
+        Requires=network-online.target
+        After=network-online.target
+        [Service]
+        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+        ExecStartPre= /usr/bin/curl -L -o /opt/bin/setup-network-environment -z /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/v1.0.0/setup-network-environment
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
+        ExecStart=/opt/bin/setup-network-environment
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: fleet.service
+      command: start
+    - name: flanneld.service
+      command: start
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Unit]
+            Requires=etcd2.service
+    - name: docker.service
+      command: start
+    - name: kube-proxy.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Proxy
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=setup-network-environment.service
+        After=setup-network-environment.service
+        [Service]
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-proxy -z /opt/bin/kube-proxy https://storage.googleapis.com/kubernetes-release/release/v1.1.2/bin/linux/amd64/kube-proxy
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-proxy
+        # wait for kubernetes master to be up and ready
+        #ExecStartPre=/opt/bin/wupiao <master-ip> 8080
+        ExecStart=/opt/bin/kube-proxy \
+        --master=<master-ip>:8080 \
+        --logtostderr=true
+        Restart=always
+        RestartSec=10
+    - name: kube-kubelet.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Kubelet
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=setup-network-environment.service
+        After=setup-network-environment.service
+        [Service]
+        EnvironmentFile=/etc/network-environment
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/kubelet -z /opt/bin/kubelet https://storage.googleapis.com/kubernetes-release/release/v1.1.2/bin/linux/amd64/kubelet
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/kubelet
+        # wait for kubernetes master to be up and ready
+        #ExecStartPre=/opt/bin/wupiao 127.0.0.1 8080
+        ExecStart=/opt/bin/kubelet \
+        --address=0.0.0.0 \
+        --port=10250 \
+        --hostname-override=<node-ip> \
+        --api-servers=<master-ip>:8080 \
+        --allow-privileged=true \
+        --logtostderr=true \
+        --cadvisor-port=4194 \
+        --healthz-bind-address=0.0.0.0 \
+        --healthz-port=10248 \
+        --cluster-dns=192.168.0.10 \
+        --cluster-domain=cluster.local
+        Restart=always
+        RestartSec=10
+  update:
+    group: alpha
+    reboot-strategy: off
